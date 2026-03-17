@@ -3,7 +3,7 @@
   "plugin": {
     "name": "unicorn-tracer-arm64",
     "entryPoint": "dyn_trace_ida.py",
-    "version": "0.2",
+    "version": "0.3",
     "idaVersions": ["9.0", "9.1"],
     "description": "This project provides a lightweight Unicorn engine-based ARM64 dynamic tracing emulation tool that can run as an IDA Pro plugin or standalone. The tool integrates tightly with IDA to ensure execution consistency and avoid errors. It provides reliable simulation reproduction capabilities and generates beautiful Tenet logs for debugging and analysis. Key features include dynamic code simulation, memory dumping, register state tracking, and instruction-level logging.",
     "license": "MIT",
