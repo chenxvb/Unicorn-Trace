@@ -23,6 +23,7 @@
   - 自动跳过外部函数调用
   - 合并多个执行片段的追踪日志
   - 支持跨内存转储的连续执行
+  - 支持 Tenet 日志反向切片（`trace_slice_tenet.py`）
 
 - **单脚本模式** (`single_script/dynamic_dump.py`)
   - 直接在 IDA 中执行，无需库文件依赖
@@ -36,6 +37,7 @@
 ├── local_emu.py              # 独立模拟器
 ├── unicorn_trace/                # 模拟器核心
 │   └── unicorn_class.py          # ARM64 模拟器基类
+│   └── trace_slicer.py           # Tenet 反向切片器
 ├── single_script/                # 实用脚本
 │   ├── dynamic_dump.py           # IDA 单脚本版本
 │   └── dump_single.py            # 单次转储脚本（未提供）
@@ -44,6 +46,7 @@
 │   ├── 2.gif
 │   └── 3.gif
 ├── example.py                    # 离线模拟调用样例 
+├── trace_slice_tenet.py          # 反向切片 CLI 入口
 ├── README.md                     # 英文文档
 └── README_zh.md                  # 中文文档
 ```
@@ -159,6 +162,38 @@ else:
 - **统一日志**：所有追踪数据集中一处，便于分析
 
 可以参考 `example.py` 实现
+
+### 功能四：Tenet 日志反向切片（新增）
+
+该功能参考 `trace-slice` 的思路，将与目标值相关的指令行从海量 `tenet.log` 中自动提取出来。
+
+#### 使用方式
+
+```bash
+python3 trace_slice_tenet.py <tenet.log|sim.log> \
+  --from reg:x0@last \
+  --from mem:0x7752948558@last \
+  --dump-dir <dump_目录> \
+  -o sliced_tenet.log
+```
+
+#### 参数说明
+
+- `--from`：切片起点（可重复）
+  - `reg:x0@last`：从寄存器最后一次定义开始
+  - `reg:x8@12000`：从第 12000 行（1-based）及之前最近一次 `x8` 定义开始
+  - `mem:0x7752948558@last`：从内存字节最后一次写入开始
+  - `mem:0x7752948558@12000`：从第 12000 行及之前最近一次写入该地址开始
+- `--dump-dir`：包含 `segment_*.bin` 的 dump 文件夹，用于按 PC 反汇编并恢复寄存器读写依赖（建议提供）
+- `--state-trace`：当主输入是 `sim.log` 时，提供对应 `tenet.log` 作为寄存器/内存状态源（不填会自动尝试同目录 `tenet.log`）
+- `--keep-load-addr-deps`：默认会剪掉加载指令（`mr=`）的地址寄存器依赖，仅保留数据来源；加此参数可关闭剪枝
+- `-o/--output`：输出切片日志文件；不填则打印到标准输出
+
+#### 说明
+
+- 输入支持 `tenet.log` / `continuous_tenet.log` / `sim.log` / `continuous_sim.log`
+- 不提供 `--dump-dir` 时仍可运行，但寄存器依赖精度会降低（内存依赖仍可追踪）
+- 性能优化：当所有 `--from` 都是 `@行号`（不是 `@last`）时，切片器只扫描到最大目标行，内存占用和耗时会显著下降
 
 ## 示例工作流
 

@@ -23,6 +23,7 @@ The tool doesn't require full memory dumps, instead dynamically dumping memory o
   - Skip external function calls automatically
   - Merge trace logs from multiple execution segments
   - Support for continuous execution across memory dumps
+  - Backward slicing for Tenet logs (`trace_slice_tenet.py`)
 
 - **Single Script Mode** (`single_script/dynamic_dump.py`)
   - Direct execution in IDA without library dependencies
@@ -36,6 +37,7 @@ The tool doesn't require full memory dumps, instead dynamically dumping memory o
 ├── local_emu.py              # Standalone emulator
 ├── unicorn_trace/                # Emulator core
 │   └── unicorn_class.py          # ARM64 emulator base class
+│   └── trace_slicer.py           # Tenet backward slicer
 ├── single_script/                # Utility scripts
 │   ├── dynamic_dump.py           # IDA single-script version
 │   └── dump_single.py            # Single dump script (not provided)
@@ -44,6 +46,7 @@ The tool doesn't require full memory dumps, instead dynamically dumping memory o
 │   ├── 2.gif
 │   └── 3.gif
 ├── example.py                    # Example for emulator 
+├── trace_slice_tenet.py          # Backward slicing CLI entry
 ├── README.md                     # English documentation
 └── README_zh.md                  # Chinese documentation
 ```
@@ -151,6 +154,38 @@ else:
 - **Consolidated logs**: All trace data in one place for easier analysis
 
 See `example.py`
+
+### Feature 4: Backward Slicing For Tenet Logs (New)
+
+This feature follows the same idea as `trace-slice`: keep only lines that contribute to a target value.
+
+#### Usage
+
+```bash
+python3 trace_slice_tenet.py <tenet.log|sim.log> \
+  --from reg:x0@last \
+  --from mem:0x7752948558@last \
+  --dump-dir <dump_dir> \
+  -o sliced_tenet.log
+```
+
+#### Parameters
+
+- `--from`: slice root (repeatable)
+  - `reg:x0@last`: start from the last definition of `x0`
+  - `reg:x8@12000`: start from the nearest definition of `x8` at/before line 12000 (1-based)
+  - `mem:0x7752948558@last`: start from the last write to this memory byte
+  - `mem:0x7752948558@12000`: start from nearest write at/before line 12000
+- `--dump-dir`: dump folder with `segment_*.bin`, used to decode instruction-level register read/write dependencies (recommended)
+- `--state-trace`: when input is `sim.log`, provide paired `tenet.log` as state source (if omitted, tries sibling `tenet.log` automatically)
+- `--keep-load-addr-deps`: by default, slicer prunes register address deps on load lines (`mr=`) and keeps value deps; add this flag to disable pruning
+- `-o/--output`: output file path; if omitted, print to stdout
+
+#### Notes
+
+- Works with `tenet.log`, `continuous_tenet.log`, `sim.log`, and `continuous_sim.log`
+- If `--dump-dir` is omitted, slicing still works but register dependency precision is lower (memory dependency still works)
+- Performance optimization: if all `--from` roots use `@LINE` (not `@last`), slicer scans only up to the max target line, which greatly reduces memory/time on huge traces
 
 ## Example Workflow
 Also see [Kanxue Article](https://bbs.kanxue.com/thread-289135.htm)

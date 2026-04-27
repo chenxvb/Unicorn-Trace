@@ -8,3 +8,8 @@ Unicorn_Trace.zip
 tmp
 plans
 dump
+.vscode/settings.json
+SKILL.md
+test_api.py
+trace_slice_tenet.py
+trace.zip

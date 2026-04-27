@@ -165,6 +165,90 @@ class IDAArm64Emulator(Arm64Emulator):
     # ==============================
     # 重写父类方法 - 主要模拟
     # ==============================
+    def load_memory_mappings(self, load_dumps_path):
+        """重写：加载内存映射，集成IDA段信息"""
+        mem_list = os.listdir(load_dumps_path)
+        map_list = []
+        
+        # 解析内存映射文件
+        for filename in mem_list:
+            pattern = r'0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)_0x([0-9a-fA-F]+)\.bin$'
+            match = re.search(pattern, filename)
+            if match:
+                mem_base = int(match.group(1), 16)
+                mem_end = int(match.group(2), 16)
+                mem_size = int(match.group(3), 16)
+                map_list.append((mem_base, mem_end, mem_size, filename))
+
+        # 按照内存基址排序后加载
+        map_list.sort(key=lambda x: x[0])
+        self.map_range.sort(key=lambda x: x[0])
+
+        new_map_range = []
+        current_start, current_end = None, None
+
+        for start, end in self.map_range:
+            if current_end is None:
+                current_start, current_end = start, end
+            elif current_end == start:
+                current_end = end
+            else:
+                new_map_range.append((current_start, current_end))
+                current_start, current_end = start, end
+
+        # 添加最后一个区间
+        if current_start is not None:
+            new_map_range.append((current_start, current_end))
+
+        self.map_range = new_map_range
+
+        for mem_base, mem_end, mem_size, filename in map_list:
+            if filename in self.loaded_files:
+                continue
+
+            upper_bound = mem_base
+            lower_bound = mem_end
+
+            for mem_range in self.map_range:
+                if upper_bound <= mem_range[1] and upper_bound >= mem_range[0]:
+                    if upper_bound < mem_range[1]:
+                        upper_bound = mem_range[1]
+
+                if lower_bound <= mem_range[1] and lower_bound >= mem_range[0]:
+                    if lower_bound > mem_range[0]:
+                        lower_bound = mem_range[0]
+
+            if mem_base < upper_bound:
+                mem_base = upper_bound
+            if mem_base & 0xfff != 0:
+                mem_base = mem_base & 0xfffffffffffff000
+
+            if mem_end > lower_bound:
+                mem_end = lower_bound
+            
+            mem_size = mem_end - mem_base
+
+            # if mem_size <= 0:
+            #     mem_size = 0x1000            
+            if mem_size <= 0:
+                self.log(f"continue: map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
+                continue
+
+            elif mem_size & 0xfff != 0:
+                mem_size = (mem_size & 0xfffffffffffff000) + 0x1000
+
+            mem_end = mem_base + mem_size
+
+            self.log(f"map file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}, bound ({hex(upper_bound)} - {hex(lower_bound)})")
+            self.mu.mem_map(mem_base, mem_size)
+            self.map_range.append((mem_base, mem_end))
+
+        # 加载内存数据
+        for mem_base, mem_end, mem_size, filename in map_list:
+            if filename not in self.loaded_files:
+                self.log(f"write file {filename} {hex(mem_base)} {hex(mem_end)} {hex(mem_size)}")
+                self.load_file(os.path.join(load_dumps_path, filename), mem_base, mem_size)
+                self.loaded_files.append(filename)
 
     def main_trace(self, so_name, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps"):
         """重写：主要模拟函数，集成IDA错误处理"""

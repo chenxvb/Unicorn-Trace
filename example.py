@@ -63,7 +63,6 @@ def user_hook(emulator, uc, address, size):
 
 success = run_all_continuous(
     "./tmp",
-    "/path/to/xxx.so",
     0x0000,
     user_hook_func=user_hook,
     debug_switch=True

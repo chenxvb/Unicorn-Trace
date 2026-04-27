@@ -18,7 +18,7 @@ class SelfRunArm64Emulator(Arm64Emulator):
         self.tpidr_value = None
         self.last_regs = None  # 用于跟踪寄存器状态，类似 dyn_trace_ida.py
 
-    def setup_from_files(self, so_path, load_path):
+    def setup_from_files(self, load_path):
         """从文件设置模拟器参数"""
         # 读取基础地址
         with open(f"{load_path}/regs.json", "r") as f:
@@ -31,7 +31,7 @@ class SelfRunArm64Emulator(Arm64Emulator):
         
         return self.BASE
 
-    def custom_main_trace(self, so_name, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps", user_hook_func=None):
+    def custom_main_trace(self, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps", user_hook_func=None):
         """自定义主要模拟函数"""
         try:
             # 初始化日志文件
@@ -49,7 +49,7 @@ class SelfRunArm64Emulator(Arm64Emulator):
 
             # 初始化trace日志
             if self.trace_log:
-                self.init_trace_log(so_name)
+                self.init_trace_log()
 
             # 映射堆内存（检查是否已映射）
             try:
@@ -164,7 +164,7 @@ def create_output_directory(base_path: str, prefix="continuous_output"):
 # 主函数
 # ==============================
 
-def main(endaddr_relative:int, so_path:str, tpidr_value_input: int = None, load_path:str = ".", save_path:str = "."):
+def main(endaddr_relative:int, tpidr_value_input: int = None, load_path:str = ".", save_path:str = "."):
     """主函数"""
     print("Emulate ARM64 code")
     
@@ -175,16 +175,13 @@ def main(endaddr_relative:int, so_path:str, tpidr_value_input: int = None, load_
     emulator.tpidr_value = tpidr_value_input
     
     # 从文件设置基础参数
-    BASE = emulator.setup_from_files(so_path, load_path)
+    BASE = emulator.setup_from_files(load_path)
     
     # 计算结束地址
     end_addr = BASE + endaddr_relative
-
-    # 提取so文件名
-    so_name = so_path.split("/")[-1]
     
     # 执行模拟
-    result_code = emulator.custom_main_trace(so_name, end_addr, 
+    result_code = emulator.custom_main_trace("qwq", end_addr, 
                                            user_log_path=f"{save_path}/sim.log", 
                                            tenet_log_path=f"{save_path}/tenet.log",
                                            load_dumps_path=load_path)
@@ -249,7 +246,7 @@ def run_all(dump_path:str, so_path:str, end_addr_relative:int, tdpr:int=None):
     combine_logs(dump_path,'sim.log', 'combined_sim.log')
     combine_logs(dump_path,'tenet.log', 'combined_tenet.log')
 
-def run_all_continuous(dump_path:str, so_path:str, end_addr_relative:int, tdpr:int=None, user_hook_func=None, debug_switch=False):
+def run_all_continuous(dump_path:str, end_addr_relative:int, tdpr:int=None, user_hook_func=None, debug_switch=False):
     """
     新的连续执行函数：从前面往后面执行，跳过外部调用并合并
     
@@ -282,9 +279,7 @@ def run_all_continuous(dump_path:str, so_path:str, end_addr_relative:int, tdpr:i
     combined_sim_log = open(combined_sim_log_path, "w")
     combined_tenet_log = open(combined_tenet_log_path, "w")
     
-    # 4. 提取so文件名
-    so_name = os.path.basename(so_path)
-    
+    # 4. 提取so文件名    
     # 5. 创建模拟器实例
     emulator = SelfRunArm64Emulator()
     emulator.tpidr_value = tdpr
@@ -292,7 +287,7 @@ def run_all_continuous(dump_path:str, so_path:str, end_addr_relative:int, tdpr:i
     # 6. 处理第一个dump文件夹获取基础地址
     first_folder = dump_folders[0]
     first_path = f"{dump_path}/{first_folder}"
-    BASE = emulator.setup_from_files(so_path, first_path)
+    BASE = emulator.setup_from_files(first_path)
     emulator.debug = debug_switch
     end_addr = BASE + end_addr_relative
     
@@ -310,7 +305,6 @@ def run_all_continuous(dump_path:str, so_path:str, end_addr_relative:int, tdpr:i
         
         # 执行模拟
         result_code = emulator.custom_main_trace(
-            so_name,
             end_addr,
             user_log_path=f"{segment_dir}/sim.log",
             tenet_log_path=f"{segment_dir}/tenet.log",
@@ -386,8 +380,7 @@ def run_once(dump_path:str, so_path:str,end_addr_relative:int, tdpr:int=None):
 if __name__ == "__main__":
     
     success = run_all_continuous(
-        "/path/to/all_the_dumps",
-        "/path/to/your/so",
-        0x00000
+        "tmp/tmp_tmp",
+        0x16ac20
     )
     
