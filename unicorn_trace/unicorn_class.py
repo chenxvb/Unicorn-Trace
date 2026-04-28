@@ -555,8 +555,10 @@ class Arm64Emulator:
             self.load_file(os.path.join(load_dumps_path, filename), mem_base, mem_size)
             self.loaded_files.append(filename)
 
-    def init_trace_log(self, so_name):
+    def init_trace_log(self, so_name, dump_dir=None):
         """初始化trace日志"""
+        if self.trace_log and dump_dir:
+            self.trace_log.write(f"# DUMP_DIR: {os.path.abspath(dump_dir)}\n")
         # self.trace_log.write(f"# SO: {so_name} @ {hex(self.BASE)}\n")
         
         # 记录初始寄存器状态
@@ -596,7 +598,7 @@ class Arm64Emulator:
 
             # 初始化trace日志
             if self.trace_log:
-                self.init_trace_log(so_name)
+                self.init_trace_log(so_name, load_dumps_path)
 
             # 映射堆内存
             self.mu.mem_map(self.HEAP_BASE, self.HEAP_SIZE)
@@ -661,4 +663,3 @@ class Arm64Emulator:
         
         # 清空钩子列表
         self.hooks.clear()
-

@@ -26,27 +26,37 @@ ROUND_MAX = 1000
 class UnicornEmulatorForm(idaapi.Form):
     """Unicorn模拟器配置表单"""
     
-    def __init__(self):
-        idaapi.Form.__init__(self, r"""STARTITEM 0
+    def __init__(self, auto_base: int, auto_end: int):
+        auto_range_text = f"{hex(auto_base)} - {hex(auto_end)}"
+        idaapi.Form.__init__(self, f"""STARTITEM 0
 Unicorn ARM64 Emulator
 
-<##END Relative addr (hex)         :{end_addr}>
-<##So Name (Enter when enale tenet):{so_name}>
-<##TPIDR (hex, optional)           :{tpidr_value}>
-<##output path (defalt .)          :{output_path}>
-<##Check boxes##enable Tenet:{enable_tenet}>{enable_group}>
+Auto Range (from IDB): {auto_range_text}
+<##END addr (hex)                  :{{end_addr}}>
+<##So Name (Enter when enale tenet):{{so_name}}>
+<##TPIDR (hex, optional)           :{{tpidr_value}}>
+<##Bound start (hex)               :{{bound_start}}>
+<##Bound end (hex)                 :{{bound_end}}>
+<##output path (defalt .)          :{{output_path}}>
+<##Check boxes##enable Tenet:{{enable_tenet}}><use custom bound:{{use_custom_bound}}><end addr absolute:{{end_addr_absolute}}>{{enable_group}}>
 """, {
             'end_addr': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30),
             'so_name': idaapi.Form.StringInput(swidth=30,value=""),
             'tpidr_value': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=0),
+            'bound_start': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=auto_base),
+            'bound_end': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=auto_end),
             'output_path': idaapi.Form.StringInput(swidth=30,value="."),
-            'enable_group': idaapi.Form.ChkGroupControl(("enable_tenet",)),
+            'enable_group': idaapi.Form.ChkGroupControl(("enable_tenet", "use_custom_bound", "end_addr_absolute")),
         })
         
         self.end_addr = 0x0000
         self.so_name = ""
         self.tpidr_value = None
         self.enable_tenet = False
+        self.use_custom_bound = False
+        self.end_addr_absolute = False
+        self.bound_start = auto_base
+        self.bound_end = auto_end
         self.output_path = "."
 
 # ==============================
@@ -71,32 +81,57 @@ class UnicornEmulatorPlugin(idaapi.plugin_t):
     def run(self, arg):
         """运行插件"""
         try:
+            auto_base = idaapi.get_imagebase()
+            text_seg = ida_segment.get_segm_by_name(".text")
+            if text_seg:
+                auto_end = text_seg.end_ea
+            else:
+                print("[-] Cannot FOUND .text seg")
+                return
+
             # 创建并显示配置表单
-            form = UnicornEmulatorForm()
+            form = UnicornEmulatorForm(auto_base, auto_end)
             form.Compile()
             
             ok = form.Execute()
             if ok == 1:
                 # 获取表单数据
-                end_addr_relative = form.end_addr.value
+                end_addr_input = form.end_addr.value
                 so_name = form.so_name.value
                 tpidr_value = form.tpidr_value.value if form.tpidr_value.value != 0 else None
-                if form.enable_group.value == 1:
-                    enable_tenet = True
-                else:
-                    enable_tenet = None
+                flags = form.enable_group.value
+                enable_tenet = bool(flags & 0x1)
+                use_custom_bound = bool(flags & 0x2)
+                end_addr_absolute = bool(flags & 0x4)
+                bound_start = form.bound_start.value
+                bound_end = form.bound_end.value
                 output_path = form.output_path.value
 
                 print(f"[+] 配置参数:")
-                print(f"结束地址: {hex(end_addr_relative)}")
+                print(f"自动范围: {hex(auto_base)} - {hex(auto_end)}")
+                print(f"结束地址输入: {hex(end_addr_input)} ({'absolute' if end_addr_absolute else 'relative'})")
                 print(f"SO名称: {so_name}")
                 if tpidr_value:
                     print(f"TPIDR值: {hex(tpidr_value)}")
                 print(f"启用Tenet: {enable_tenet}")
+                if use_custom_bound:
+                    print(f"自定义Bound: {hex(bound_start)} - {hex(bound_end)}")
+                else:
+                    print("自定义Bound: 未启用（使用自动范围）")
                 print(f"输出路径: {output_path}")
                 # 创建模拟器实例并运行
-                if end_addr_relative != None:
-                    uni_trace_main(end_addr_relative, so_name, tpidr_value, enable_tenet, output_path)
+                if end_addr_input != None:
+                    uni_trace_main(
+                        endaddr_input=end_addr_input,
+                        so_name=so_name,
+                        tpidr_value_input=tpidr_value,
+                        enable_tenet=enable_tenet,
+                        user_path=output_path,
+                        end_addr_absolute=end_addr_absolute,
+                        use_custom_bound=use_custom_bound,
+                        bound_start=bound_start,
+                        bound_end=bound_end,
+                    )
                 else:
                     print("[+] Wrong Input")
                 
@@ -267,7 +302,7 @@ class IDAArm64Emulator(Arm64Emulator):
 
                 # 初始化trace日志
                 if self.trace_log:
-                    self.init_trace_log(so_name)
+                    self.init_trace_log(so_name, load_dumps_path)
 
                 self.hooks.append(self.mu.hook_add(UC_HOOK_CODE, self.debug_hook_code))
 
@@ -634,7 +669,17 @@ class IDAArm64Emulator(Arm64Emulator):
 # 主函数 - 集成原有脚本的main函数
 # ==============================
 
-def uni_trace_main(endaddr_relative:int, so_name: str = "", tpidr_value_input: int = None, enable_tenet=False, user_path:str = "."):
+def uni_trace_main(
+    endaddr_input:int,
+    so_name: str = "",
+    tpidr_value_input: int = None,
+    enable_tenet=False,
+    user_path:str = ".",
+    end_addr_absolute: bool = False,
+    use_custom_bound: bool = False,
+    bound_start: int = None,
+    bound_end: int = None,
+):
     """主函数 - 集成原有脚本的main函数功能"""
     total_log = open(user_path + f"/uc_combine_{str(int(time.time()))}.log", "w+")
 
@@ -655,14 +700,25 @@ def uni_trace_main(endaddr_relative:int, so_name: str = "", tpidr_value_input: i
 
         text_seg = ida_segment.get_segm_by_name(".text")
         if text_seg:
-            emulator.END = text_seg.end_ea
+            auto_end = text_seg.end_ea
+            emulator.END = auto_end
         else:
             print("[-] Cannot FOUND .text seg")
             break
 
-        emulator.run_range = (emulator.BASE, emulator.END)
+        auto_range = (emulator.BASE, auto_end)
+        if use_custom_bound:
+            if bound_start is None or bound_end is None or bound_start >= bound_end:
+                print("[!] 自定义Bound无效，回退到自动范围")
+                emulator.run_range = auto_range
+            else:
+                emulator.run_range = (bound_start, bound_end)
+        else:
+            emulator.run_range = auto_range
 
-        print(f"[+] BASE = {hex(emulator.BASE)} END = {hex(emulator.END)}")
+        print(f"[+] BASE = {hex(emulator.BASE)} END = {hex(auto_end)}")
+        print(f"[+] Auto Range = {hex(auto_range[0])} - {hex(auto_range[1])}")
+        print(f"[+] Run Range  = {hex(emulator.run_range[0])} - {hex(emulator.run_range[1])}")
         print("[+] DUMPING memory")
         
         # 转储寄存器指向的内存
@@ -675,15 +731,32 @@ def uni_trace_main(endaddr_relative:int, so_name: str = "", tpidr_value_input: i
         if tpidr_value_input != None:
             registers["tpidr"] = hex(tpidr_value_input)
 
+        if end_addr_absolute:
+            end_addr = endaddr_input
+        else:
+            end_addr = emulator.BASE + endaddr_input
+
         registers["base"] = hex(emulator.BASE)
-        registers["end"] = hex(emulator.END)
+        registers["end"] = hex(auto_end)
+        registers["run_start"] = hex(emulator.run_range[0])
+        registers["run_end"] = hex(emulator.run_range[1])
+        registers["end_addr_input"] = hex(endaddr_input)
+        registers["end_addr_absolute"] = bool(end_addr_absolute)
+        registers["resolved_end_addr"] = hex(end_addr)
+        registers["use_custom_bound"] = bool(use_custom_bound)
+        if bound_start is not None:
+            registers["bound_start"] = hex(bound_start)
+        if bound_end is not None:
+            registers["bound_end"] = hex(bound_end)
+        registers["enable_tenet"] = bool(enable_tenet)
+        if so_name:
+            registers["so_name"] = so_name
 
         print("[+] DUMPING registers")
         with open(f"{emulator.dump_path}/regs.json", "w+") as f:
             json.dump(registers, f)
 
         emulator.tpidr_value = tpidr_value_input
-        end_addr = emulator.BASE + endaddr_relative
         result_code = 11400
         
         if enable_tenet:

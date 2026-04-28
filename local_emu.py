@@ -14,8 +14,11 @@ class SelfRunArm64Emulator(Arm64Emulator):
         """初始化模拟器"""
         super().__init__(heap_base, heap_size)
         self.BASE = 0
+        self.END = 0
         self.run_range = (0, 0)
+        self.auto_run_range = (0, 0)
         self.tpidr_value = None
+        self.dump_config = {}
         self.last_regs = None  # 用于跟踪寄存器状态，类似 dyn_trace_ida.py
 
     def setup_from_files(self, load_path):
@@ -23,15 +26,27 @@ class SelfRunArm64Emulator(Arm64Emulator):
         # 读取基础地址
         with open(f"{load_path}/regs.json", "r") as f:
             tmp = json.load(f)
+            self.dump_config = tmp
             self.BASE = int(tmp["base"], 16)
             self.END = int(tmp["end"], 16)
+            run_start = int(tmp.get("run_start", tmp["base"]), 16)
+            run_end = int(tmp.get("run_end", tmp["end"]), 16)
         
-        # 计算运行范围
-        self.run_range = (self.BASE, self.END)
+        # 自动范围来自base/end，实际运行范围优先使用run_start/run_end
+        self.auto_run_range = (self.BASE, self.END)
+        self.run_range = (run_start, run_end)
         
         return self.BASE
 
-    def custom_main_trace(self, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps", user_hook_func=None):
+    def custom_main_trace(
+        self,
+        end_addr,
+        so_name="",
+        tenet_log_path=None,
+        user_log_path="./uc.log",
+        load_dumps_path="./dumps",
+        user_hook_func=None
+    ):
         """自定义主要模拟函数"""
         try:
             # 初始化日志文件
@@ -49,7 +64,7 @@ class SelfRunArm64Emulator(Arm64Emulator):
 
             # 初始化trace日志
             if self.trace_log:
-                self.init_trace_log()
+                self.init_trace_log(so_name or "", load_dumps_path)
 
             # 映射堆内存（检查是否已映射）
             try:
@@ -164,27 +179,150 @@ def create_output_directory(base_path: str, prefix="continuous_output"):
 # 主函数
 # ==============================
 
-def main(endaddr_relative:int, tpidr_value_input: int = None, load_path:str = ".", save_path:str = "."):
+def _resolve_end_addr(base: int, end_addr_input: int, end_addr_absolute: bool) -> int:
+    """根据输入模式解析结束地址"""
+    if end_addr_absolute:
+        return end_addr_input
+    return base + end_addr_input
+
+
+def _resolve_so_name_from_dump(dump_cfg: dict, so_name_input: str = None) -> str:
+    """优先使用显式so_name，否则从dump参数读取，最终回退为空字符串"""
+    if so_name_input:
+        return so_name_input
+    cfg_so_name = dump_cfg.get("so_name")
+    if isinstance(cfg_so_name, str):
+        return cfg_so_name
+    return ""
+
+
+def _parse_optional_int(value):
+    """解析可选整数，支持int与十六进制字符串"""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return None
+        if text.startswith("-0x") or text.startswith("0x"):
+            return int(text, 16)
+        return int(text, 10)
+    return None
+
+
+def _resolve_end_addr_from_dump(base: int, dump_cfg: dict, end_addr_input, end_addr_absolute):
+    """优先使用dump参数解析结束地址，显式传参可覆盖"""
+    cfg_resolved_end = _parse_optional_int(dump_cfg.get("resolved_end_addr"))
+    cfg_end_input = _parse_optional_int(dump_cfg.get("end_addr_input"))
+    cfg_end_absolute = dump_cfg.get("end_addr_absolute")
+    if isinstance(cfg_end_absolute, str):
+        cfg_end_absolute = cfg_end_absolute.lower() == "true"
+    elif cfg_end_absolute is None:
+        cfg_end_absolute = False
+    else:
+        cfg_end_absolute = bool(cfg_end_absolute)
+
+    if end_addr_input is None:
+        if cfg_resolved_end is not None:
+            return cfg_resolved_end, True
+        if cfg_end_input is not None:
+            return _resolve_end_addr(base, cfg_end_input, cfg_end_absolute), cfg_end_absolute
+        raise ValueError("未提供 end_addr_input，且dump参数中也没有结束地址")
+
+    if end_addr_absolute is None:
+        effective_absolute = cfg_end_absolute
+    else:
+        effective_absolute = bool(end_addr_absolute)
+
+    return _resolve_end_addr(base, end_addr_input, effective_absolute), effective_absolute
+
+
+def _resolve_run_range(
+    auto_range: tuple,
+    base: int,
+    bound_start: int = None,
+    bound_end: int = None,
+    bound_is_relative: bool = False
+):
+    """解析运行范围，若未提供自定义bound则返回自动范围"""
+    if bound_start is None or bound_end is None:
+        return auto_range
+
+    if bound_is_relative:
+        resolved_start = base + bound_start
+        resolved_end = base + bound_end
+    else:
+        resolved_start = bound_start
+        resolved_end = bound_end
+
+    if resolved_start >= resolved_end:
+        print("[!] 自定义bound无效（start >= end），回退到自动范围")
+        return auto_range
+
+    return (resolved_start, resolved_end)
+
+
+def main(
+    end_addr_input:int = None,
+    so_name: str = None,
+    tpidr_value_input: int = None,
+    load_path:str = ".",
+    save_path:str = ".",
+    end_addr_absolute: bool = None,
+    bound_start: int = None,
+    bound_end: int = None,
+    bound_is_relative: bool = False,
+):
     """主函数"""
     print("Emulate ARM64 code")
     
     # 创建模拟器实例
     emulator = SelfRunArm64Emulator()
-    
-    # 设置参数
-    emulator.tpidr_value = tpidr_value_input
-    
+
     # 从文件设置基础参数
     BASE = emulator.setup_from_files(load_path)
+    dump_cfg = emulator.dump_config
+
+    # 设置TPIDR：显式传参优先，否则读取dump参数
+    if tpidr_value_input is not None:
+        emulator.tpidr_value = tpidr_value_input
+    else:
+        emulator.tpidr_value = _parse_optional_int(dump_cfg.get("tpidr"))
     
-    # 计算结束地址
-    end_addr = BASE + endaddr_relative
+    # 计算结束地址：优先读取dump参数
+    end_addr, effective_end_addr_absolute = _resolve_end_addr_from_dump(
+        BASE,
+        dump_cfg,
+        end_addr_input,
+        end_addr_absolute,
+    )
+    resolved_so_name = _resolve_so_name_from_dump(dump_cfg, so_name)
+
+    # 运行范围：默认用dump时记录的run_range，仅在显式传入bound时覆盖
+    if bound_start is not None and bound_end is not None:
+        emulator.run_range = _resolve_run_range(
+            emulator.auto_run_range,
+            BASE,
+            bound_start=bound_start,
+            bound_end=bound_end,
+            bound_is_relative=bound_is_relative,
+        )
+    print(f"[+] 自动范围: {hex(emulator.auto_run_range[0])} - {hex(emulator.auto_run_range[1])}")
+    print(f"[+] 运行范围: {hex(emulator.run_range[0])} - {hex(emulator.run_range[1])}")
+    print(f"[+] SO Name: {resolved_so_name if resolved_so_name else '<empty>'}")
+    print(f"[+] TPIDR: {hex(emulator.tpidr_value) if emulator.tpidr_value is not None else 'None'}")
+    print(f"[+] 结束地址: {hex(end_addr)} ({'absolute' if effective_end_addr_absolute else 'relative'})")
     
     # 执行模拟
-    result_code = emulator.custom_main_trace("qwq", end_addr, 
-                                           user_log_path=f"{save_path}/sim.log", 
-                                           tenet_log_path=f"{save_path}/tenet.log",
-                                           load_dumps_path=load_path)
+    result_code = emulator.custom_main_trace(
+        end_addr,
+        so_name=resolved_so_name,
+        user_log_path=f"{save_path}/sim.log",
+        tenet_log_path=f"{save_path}/tenet.log",
+        load_dumps_path=load_path
+    )
     print("[+] Finish!")
     return result_code
 
@@ -229,15 +367,15 @@ def combine_logs(path, pattern, output_filename):
     print(f"Combined {len(files)} files into {output_filename} (sorted)")
     return True
 
-def run_all(dump_path:str, so_path:str, end_addr_relative:int, tdpr:int=None):
+def run_all(dump_path:str, so_path:str=None, end_addr_relative:int=None, tdpr:int=None, so_name: str = None):
     """旧的run_all函数：独立执行每个dump文件夹"""
     files = os.listdir(dump_path)
     for i in files:
         pattern = r"dump_\d+$"
         match = re.search(pattern, i)
         if match :
-            main(end_addr_relative, 
-                so_path,
+            main(end_addr_input=end_addr_relative,
+                so_name=so_name,
                 tpidr_value_input=tdpr,
                 load_path=f"{dump_path}/{i}",
                 save_path=f"{dump_path}/{i}")
@@ -246,14 +384,24 @@ def run_all(dump_path:str, so_path:str, end_addr_relative:int, tdpr:int=None):
     combine_logs(dump_path,'sim.log', 'combined_sim.log')
     combine_logs(dump_path,'tenet.log', 'combined_tenet.log')
 
-def run_all_continuous(dump_path:str, end_addr_relative:int, tdpr:int=None, user_hook_func=None, debug_switch=False):
+def run_all_continuous(
+    dump_path:str,
+    end_addr_input:int = None,
+    so_name: str = None,
+    tdpr:int=None,
+    user_hook_func=None,
+    debug_switch=False,
+    end_addr_absolute: bool = None,
+    bound_start: int = None,
+    bound_end: int = None,
+    bound_is_relative: bool = False,
+):
     """
     新的连续执行函数：从前面往后面执行，跳过外部调用并合并
     
     参数:
         dump_path: dump文件夹路径
-        so_path: so文件路径
-        end_addr_relative: 目标地址的相对偏移
+        end_addr_input: 目标地址输入
         tdpr: TPIDR寄存器值 (无需填写)
     
     返回:
@@ -288,11 +436,35 @@ def run_all_continuous(dump_path:str, end_addr_relative:int, tdpr:int=None, user
     first_folder = dump_folders[0]
     first_path = f"{dump_path}/{first_folder}"
     BASE = emulator.setup_from_files(first_path)
+    dump_cfg = emulator.dump_config
     emulator.debug = debug_switch
-    end_addr = BASE + end_addr_relative
+    if tdpr is not None:
+        emulator.tpidr_value = tdpr
+    else:
+        emulator.tpidr_value = _parse_optional_int(dump_cfg.get("tpidr"))
+
+    end_addr, effective_end_addr_absolute = _resolve_end_addr_from_dump(
+        BASE,
+        dump_cfg,
+        end_addr_input,
+        end_addr_absolute,
+    )
+    resolved_so_name = _resolve_so_name_from_dump(dump_cfg, so_name)
+    if bound_start is not None and bound_end is not None:
+        emulator.run_range = _resolve_run_range(
+            emulator.auto_run_range,
+            BASE,
+            bound_start=bound_start,
+            bound_end=bound_end,
+            bound_is_relative=bound_is_relative,
+        )
     
     print(f"[+] 基础地址: {hex(BASE)}")
-    print(f"[+] 目标地址: {hex(end_addr)}")
+    print(f"[+] 自动范围: {hex(emulator.auto_run_range[0])} - {hex(emulator.auto_run_range[1])}")
+    print(f"[+] 运行范围: {hex(emulator.run_range[0])} - {hex(emulator.run_range[1])}")
+    print(f"[+] SO Name: {resolved_so_name if resolved_so_name else '<empty>'}")
+    print(f"[+] TPIDR: {hex(emulator.tpidr_value) if emulator.tpidr_value is not None else 'None'}")
+    print(f"[+] 目标地址: {hex(end_addr)} ({'absolute' if effective_end_addr_absolute else 'relative'})")
     
     # 7. 循环处理所有dump文件夹
     success = False
@@ -306,6 +478,7 @@ def run_all_continuous(dump_path:str, end_addr_relative:int, tdpr:int=None, user
         # 执行模拟
         result_code = emulator.custom_main_trace(
             end_addr,
+            so_name=resolved_so_name,
             user_log_path=f"{segment_dir}/sim.log",
             tenet_log_path=f"{segment_dir}/tenet.log",
             load_dumps_path=dump_folder_path,
@@ -369,18 +542,33 @@ def run_all_continuous(dump_path:str, end_addr_relative:int, tdpr:int=None, user
     
     return emulator
 
-def run_once(dump_path:str, so_path:str,end_addr_relative:int, tdpr:int=None):
-    result = main(end_addr_relative, 
-        so_path, 
+def run_once(
+    dump_path:str,
+    so_path:str=None,
+    end_addr_input:int = None,
+    so_name: str = None,
+    tdpr:int=None,
+    end_addr_absolute: bool = None,
+    bound_start: int = None,
+    bound_end: int = None,
+    bound_is_relative: bool = False,
+):
+    result = main(
+        end_addr_input=end_addr_input,
+        so_name=so_name,
         tpidr_value_input=tdpr,
         load_path=dump_path,
-        save_path=dump_path)
+        save_path=dump_path,
+        end_addr_absolute=end_addr_absolute,
+        bound_start=bound_start,
+        bound_end=bound_end,
+        bound_is_relative=bound_is_relative,
+    )
     return result
 
 if __name__ == "__main__":
     
     success = run_all_continuous(
-        "tmp/tmp_tmp",
-        0x16ac20
+        "tmp"
     )
     
