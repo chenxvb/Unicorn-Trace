@@ -2,6 +2,8 @@ import time
 import json
 import re
 import os
+import hashlib
+import sys
 import capstone
 from unicorn import *
 from unicorn.arm64_const import *
@@ -10,7 +12,27 @@ import idc
 import ida_bytes
 import idaapi
 import ida_dbg
+import ida_kernwin
 from unicorn_trace.unicorn_class import Arm64Emulator # type: ignore
+
+try:
+    import PySide6.QtWidgets as QtWidgets
+    import PySide6.QtCore as QtCore
+    import PySide6.QtGui as QtGui
+except ImportError:
+    try:
+        import PyQt5.QtWidgets as QtWidgets
+        import PyQt5.QtCore as QtCore
+        import PyQt5.QtGui as QtGui
+    except ImportError:
+        try:
+            import PySide2.QtWidgets as QtWidgets
+            import PySide2.QtCore as QtCore
+            import PySide2.QtGui as QtGui
+        except ImportError:
+            QtWidgets = None
+            QtCore = None
+            QtGui = None
 
 # ==============================
 # 常量定义
@@ -18,46 +40,472 @@ from unicorn_trace.unicorn_class import Arm64Emulator # type: ignore
 
 DUMP_SINGLE_SEG_SIZE = 0x4000
 ROUND_MAX = 1000
+PANEL_TITLE = "Unicorn ARM64 Tracer"
+LOG_MAX_BLOCKS = 2000
 
 # ==============================
 # 插件表单类
 # ==============================
 
-class UnicornEmulatorForm(idaapi.Form):
-    """Unicorn模拟器配置表单"""
-    
-    def __init__(self, auto_base: int, auto_end: int):
-        auto_range_text = f"{hex(auto_base)} - {hex(auto_end)}"
-        idaapi.Form.__init__(self, f"""STARTITEM 0
-Unicorn ARM64 Emulator
+def _parse_addr(text: str, field_name: str, allow_empty=False):
+    value = text.strip()
+    if not value:
+        if allow_empty:
+            return None
+        raise ValueError(f"{field_name} 不能为空")
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise ValueError(f"{field_name} 不是有效数字: {value}")
 
-Auto Range (from IDB): {auto_range_text}
-<##END addr (hex)                  :{{end_addr}}>
-<##So Name (Enter when enale tenet):{{so_name}}>
-<##TPIDR (hex, optional)           :{{tpidr_value}}>
-<##Bound start (hex)               :{{bound_start}}>
-<##Bound end (hex)                 :{{bound_end}}>
-<##output path (defalt .)          :{{output_path}}>
-<##Check boxes##enable Tenet:{{enable_tenet}}><use custom bound:{{use_custom_bound}}><end addr absolute:{{end_addr_absolute}}>{{enable_group}}>
-""", {
-            'end_addr': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30),
-            'so_name': idaapi.Form.StringInput(swidth=30,value=""),
-            'tpidr_value': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=0),
-            'bound_start': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=auto_base),
-            'bound_end': idaapi.Form.NumericInput(tp=idaapi.Form.FT_ADDR,swidth=30,value=auto_end),
-            'output_path': idaapi.Form.StringInput(swidth=30,value="."),
-            'enable_group': idaapi.Form.ChkGroupControl(("enable_tenet", "use_custom_bound", "end_addr_absolute")),
-        })
-        
-        self.end_addr = 0x0000
-        self.so_name = ""
-        self.tpidr_value = None
-        self.enable_tenet = False
-        self.use_custom_bound = False
-        self.end_addr_absolute = False
-        self.bound_start = auto_base
-        self.bound_end = auto_end
-        self.output_path = "."
+
+def _resolve_cache_dir():
+    base_dir = None
+    try:
+        if hasattr(idaapi, "get_user_idadir"):
+            base_dir = idaapi.get_user_idadir()
+    except Exception:
+        base_dir = None
+
+    if not base_dir:
+        base_dir = os.path.join(os.path.expanduser("~"), ".idapro")
+
+    cache_dir = os.path.join(base_dir, "unicorn_arm64_emulator")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _resolve_cache_path():
+    idb_path = ""
+    try:
+        idb_path = idc.get_idb_path() or ""
+    except Exception:
+        idb_path = ""
+    if not idb_path:
+        try:
+            idb_path = idaapi.get_input_file_path() or ""
+        except Exception:
+            idb_path = ""
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(idb_path) or "default")
+    digest = hashlib.sha1(idb_path.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return os.path.join(_resolve_cache_dir(), f"{safe_name}_{digest}.json")
+
+
+def _normalize_dbg_addr(addr):
+    if not isinstance(addr, int):
+        return addr
+    if addr & 0xb4ff000000000000 == 0xb400000000000000:
+        return addr & 0x00ffffffffffffff
+    return addr
+
+
+def _is_executable_segment(seg):
+    if not seg:
+        return False
+    exec_perm = getattr(ida_segment, "SEGPERM_EXEC", 0x1)
+    return bool(getattr(seg, "perm", 0) & exec_perm)
+
+
+def _collect_auto_range(verbose=False):
+    """优先使用当前PC所在可执行段；失败时回退到.text，再回退到imagebase。"""
+    pc = None
+    try:
+        pc = _normalize_dbg_addr(idc.get_reg_value("pc"))
+    except Exception:
+        pc = None
+
+    if isinstance(pc, int):
+        seg = ida_segment.getseg(pc)
+        if seg and _is_executable_segment(seg):
+            return seg.start_ea, seg.end_ea
+        if verbose:
+            if seg:
+                seg_name = ida_segment.get_segm_name(seg)
+                print(f"[!] 当前PC 0x{pc:x} 位于非可执行段 {seg_name}，回退到 .text")
+            else:
+                print(f"[!] 当前PC 0x{pc:x} 不在任何段中，回退到 .text")
+    elif verbose:
+        print("[!] 无法读取当前PC，回退到 .text")
+
+    text_seg = ida_segment.get_segm_by_name(".text")
+    if text_seg:
+        return text_seg.start_ea, text_seg.end_ea
+
+    auto_base = idaapi.get_imagebase()
+    if verbose:
+        print("[!] 找不到 .text 段，回退到 imagebase")
+    return auto_base, auto_base
+
+
+class TeeOutputProxy:
+    """把 stdout/stderr 同步到原始输出和Qt日志窗口。"""
+
+    def __init__(self, original_stream, on_text):
+        self._original_stream = original_stream
+        self._on_text = on_text
+
+    def write(self, data):
+        if not isinstance(data, str):
+            data = str(data)
+        try:
+            self._original_stream.write(data)
+        except Exception:
+            pass
+        try:
+            self._on_text(data)
+        except Exception:
+            pass
+        return len(data)
+
+    def flush(self):
+        try:
+            self._original_stream.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._original_stream.isatty()
+        except Exception:
+            return False
+
+
+class UnicornTracerDialog(QtWidgets.QDialog):
+    """Unicorn Tracer 配置弹窗（非模态，可与IDA其他窗口交互）"""
+
+    def __init__(self, plugin):
+        super().__init__(None)
+        self.plugin = plugin
+        self._running = False
+        self._widgets = {}
+        self.auto_base = 0
+        self.auto_end = 0
+        self._log_dialog = None
+        self._log_view = None
+        self._orig_stdout = None
+        self._orig_stderr = None
+
+        self.setWindowTitle(PANEL_TITLE)
+        self.setModal(False)
+        if QtCore is not None:
+            self.setWindowModality(QtCore.Qt.NonModal)
+            self.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self.resize(760, 300)
+
+        self._build_ui()
+        self._refresh_auto_range(update_bounds=True)
+        self._restore_cache()
+
+    def ShowPanel(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        self._stop_log_capture()
+        if self._log_dialog is not None:
+            try:
+                self._log_dialog.close()
+            except Exception:
+                pass
+            self._log_dialog = None
+            self._log_view = None
+        self.plugin.form = None
+        super().closeEvent(event)
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._widgets["base_label"] = QtWidgets.QLabel("Image Base: 0x0")
+        layout.addWidget(self._widgets["base_label"])
+
+        self._widgets["auto_range_label"] = QtWidgets.QLabel("Auto Range (from current PC exec segment):")
+        layout.addWidget(self._widgets["auto_range_label"])
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
+
+        def add_row(row, label, key, default_value=""):
+            lbl = QtWidgets.QLabel(label)
+            edit = QtWidgets.QLineEdit(default_value)
+            grid.addWidget(lbl, row, 0)
+            grid.addWidget(edit, row, 1)
+            self._widgets[key] = edit
+
+        add_row(0, "END addr (hex, default relative to base):", "end_addr", "0x0")
+        add_row(1, "TPIDR (hex, optional):", "tpidr_value", "")
+        add_row(2, "Bound start (hex):", "bound_start", "0x0")
+        add_row(3, "Bound end (hex):", "bound_end", "0x0")
+        add_row(4, "Output path:", "output_path", ".")
+
+        layout.addLayout(grid)
+
+        cb_layout = QtWidgets.QHBoxLayout()
+        self._widgets["enable_tenet"] = QtWidgets.QCheckBox("enable Tenet")
+        self._widgets["end_addr_absolute"] = QtWidgets.QCheckBox("end addr absolute")
+        cb_layout.addWidget(self._widgets["enable_tenet"])
+        cb_layout.addWidget(self._widgets["end_addr_absolute"])
+        cb_layout.addStretch(1)
+        layout.addLayout(cb_layout)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        self._widgets["refresh_btn"] = QtWidgets.QPushButton("Refresh Range")
+        self._widgets["show_log_btn"] = QtWidgets.QPushButton("Show Log")
+        self._widgets["clear_log_btn"] = QtWidgets.QPushButton("Clear Log")
+        self._widgets["run_btn"] = QtWidgets.QPushButton("Run Tracer")
+        btn_layout.addWidget(self._widgets["refresh_btn"])
+        btn_layout.addWidget(self._widgets["show_log_btn"])
+        btn_layout.addWidget(self._widgets["clear_log_btn"])
+        btn_layout.addWidget(self._widgets["run_btn"])
+        btn_layout.addStretch(1)
+        layout.addLayout(btn_layout)
+
+        self._widgets["status_label"] = QtWidgets.QLabel("Status: Ready")
+        self._widgets["status_label"].setWordWrap(True)
+        layout.addWidget(self._widgets["status_label"])
+
+        self._widgets["refresh_btn"].clicked.connect(self._on_refresh_clicked)
+        self._widgets["show_log_btn"].clicked.connect(self._show_log_dialog)
+        self._widgets["clear_log_btn"].clicked.connect(self._clear_log_dialog)
+        self._widgets["run_btn"].clicked.connect(self._on_run_clicked)
+
+    def _ensure_log_dialog(self):
+        if self._log_dialog is not None:
+            return
+
+        self._log_dialog = QtWidgets.QDialog(self)
+        self._log_dialog.setWindowTitle("Tracer Runtime Log")
+        self._log_dialog.setModal(False)
+        if QtCore is not None:
+            self._log_dialog.setWindowModality(QtCore.Qt.NonModal)
+            self._log_dialog.setWindowFlag(QtCore.Qt.WindowStaysOnTopHint, True)
+        self._log_dialog.resize(900, 460)
+
+        layout = QtWidgets.QVBoxLayout(self._log_dialog)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._log_view = QtWidgets.QPlainTextEdit(self._log_dialog)
+        self._log_view.setReadOnly(True)
+        self._log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        if QtCore is not None:
+            self._log_view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self._log_view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        if hasattr(self._log_view, "setMaximumBlockCount"):
+            self._log_view.setMaximumBlockCount(LOG_MAX_BLOCKS)
+        layout.addWidget(self._log_view)
+
+        btn_layout = QtWidgets.QHBoxLayout()
+        copy_btn = QtWidgets.QPushButton("Copy All")
+        clear_btn = QtWidgets.QPushButton("Clear")
+        btn_layout.addWidget(copy_btn)
+        btn_layout.addWidget(clear_btn)
+        btn_layout.addStretch(1)
+        layout.addLayout(btn_layout)
+
+        copy_btn.clicked.connect(self._copy_log_all)
+        clear_btn.clicked.connect(self._clear_log_dialog)
+
+    def _show_log_dialog(self):
+        self._ensure_log_dialog()
+        self._log_dialog.show()
+        self._log_dialog.raise_()
+        self._log_dialog.activateWindow()
+
+    def _clear_log_dialog(self):
+        self._ensure_log_dialog()
+        self._log_view.clear()
+
+    def _copy_log_all(self):
+        self._ensure_log_dialog()
+        self._log_view.selectAll()
+        self._log_view.copy()
+
+    def _append_log_text(self, text):
+        if not text:
+            return
+        self._ensure_log_dialog()
+        if self._log_dialog is not None and not self._log_dialog.isVisible():
+            self._log_dialog.show()
+        if QtGui is not None:
+            self._log_view.moveCursor(QtGui.QTextCursor.End)
+        self._log_view.insertPlainText(text)
+        if QtGui is not None:
+            self._log_view.moveCursor(QtGui.QTextCursor.End)
+        QtWidgets.QApplication.processEvents()
+
+    def _start_log_capture(self):
+        if self._orig_stdout is not None:
+            return
+        self._ensure_log_dialog()
+        self._show_log_dialog()
+        self._orig_stdout = sys.stdout
+        self._orig_stderr = sys.stderr
+        sys.stdout = TeeOutputProxy(self._orig_stdout, self._append_log_text)
+        sys.stderr = TeeOutputProxy(self._orig_stderr, self._append_log_text)
+        self._append_log_text("\n===== Run Start =====\n")
+
+    def _stop_log_capture(self):
+        if self._orig_stdout is None:
+            return
+        try:
+            self._append_log_text("===== Run End =====\n")
+        except Exception:
+            pass
+        sys.stdout = self._orig_stdout
+        sys.stderr = self._orig_stderr
+        self._orig_stdout = None
+        self._orig_stderr = None
+
+    def _set_status(self, text):
+        self._widgets["status_label"].setText(f"Status: {text}")
+        ida_kernwin.refresh_idaview_anyway()
+
+    def _refresh_auto_range(self, update_bounds=False):
+        image_base = idaapi.get_imagebase()
+        self._widgets["base_label"].setText(f"Image Base: {hex(image_base)}")
+        self.auto_base, self.auto_end = _collect_auto_range()
+        self._widgets["auto_range_label"].setText(
+            f"Auto Range (from current PC exec segment): {hex(self.auto_base)} - {hex(self.auto_end)}"
+        )
+        if update_bounds:
+            self._widgets["bound_start"].setText(hex(self.auto_base))
+            self._widgets["bound_end"].setText(hex(self.auto_end))
+
+    def _on_refresh_clicked(self):
+        self._refresh_auto_range(update_bounds=True)
+        self._set_status("Auto range refreshed and custom bound overwritten")
+
+    def _restore_cache(self):
+        cached = self.plugin.load_cache()
+        if not cached:
+            return
+
+        for key in ("end_addr", "tpidr_value", "bound_start", "bound_end", "output_path"):
+            if key in cached and key in self._widgets:
+                self._widgets[key].setText(str(cached[key]))
+
+        for key in ("enable_tenet", "end_addr_absolute"):
+            if key in cached and key in self._widgets:
+                self._widgets[key].setChecked(bool(cached[key]))
+
+        last_output = cached.get("last_output_path")
+        last_time = cached.get("last_output_time")
+        last_tenet_output = cached.get("last_tenet_output_path")
+        if last_output:
+            tip = f"Loaded cached input; last output: {last_output}"
+            if last_tenet_output:
+                tip += f" | last tenet output: {last_tenet_output}"
+            if last_time:
+                tip += f" ({last_time})"
+            self._set_status(tip)
+
+    def _collect_form_values(self):
+        end_addr_input = _parse_addr(self._widgets["end_addr"].text(), "END addr")
+        tpidr_raw = self._widgets["tpidr_value"].text().strip()
+        tpidr_value = _parse_addr(tpidr_raw, "TPIDR", allow_empty=True)
+        use_custom_bound = True
+        bound_start = _parse_addr(self._widgets["bound_start"].text(), "Bound start")
+        bound_end = _parse_addr(self._widgets["bound_end"].text(), "Bound end")
+        output_path = self._widgets["output_path"].text().strip() or "."
+        output_path = os.path.abspath(os.path.expanduser(output_path))
+        end_addr_absolute = self._widgets["end_addr_absolute"].isChecked()
+        enable_tenet = self._widgets["enable_tenet"].isChecked()
+
+        if bound_start >= bound_end:
+            raise ValueError("Bound start 必须小于 Bound end")
+
+        return {
+            "end_addr": hex(end_addr_input),
+            "tpidr_value": "" if tpidr_value is None else hex(tpidr_value),
+            "bound_start": hex(bound_start),
+            "bound_end": hex(bound_end),
+            "output_path": output_path,
+            "enable_tenet": enable_tenet,
+            "use_custom_bound": use_custom_bound,
+            "end_addr_absolute": end_addr_absolute,
+            "_raw_end_addr": end_addr_input,
+            "_raw_tpidr_value": tpidr_value,
+            "_raw_bound_start": bound_start,
+            "_raw_bound_end": bound_end,
+        }
+
+    def _on_run_clicked(self):
+        if self._running:
+            print("[!] Tracer is running, please wait...")
+            return
+        try:
+            self._refresh_auto_range(update_bounds=False)
+            config = self._collect_form_values()
+        except Exception as e:
+            print(f"[-] 参数错误: {e}")
+            self._set_status(f"参数错误: {e}")
+            return
+
+        try:
+            os.makedirs(config["output_path"], exist_ok=True)
+        except Exception as e:
+            print(f"[-] 输出目录创建失败: {e}")
+            self._set_status(f"输出目录创建失败: {e}")
+            return
+
+        self._start_log_capture()
+        print("[+] 配置参数:")
+        print(f"基地址: {hex(idaapi.get_imagebase())}")
+        print(f"自动范围: {hex(self.auto_base)} - {hex(self.auto_end)}")
+        print(f"结束地址输入: {config['end_addr']} ({'absolute' if config['end_addr_absolute'] else 'relative'})")
+        if config["_raw_tpidr_value"] is not None:
+            print(f"TPIDR值: {config['tpidr_value']}")
+        print(f"启用Tenet: {config['enable_tenet']}")
+        print(f"自定义Bound: {config['bound_start']} - {config['bound_end']} (always enabled)")
+        print(f"输出路径: {config['output_path']}")
+
+        self._set_status("Running...")
+        self._running = True
+        self._widgets["run_btn"].setEnabled(False)
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            result = uni_trace_main(
+                endaddr_input=config["_raw_end_addr"],
+                tpidr_value_input=config["_raw_tpidr_value"],
+                enable_tenet=config["enable_tenet"],
+                user_path=config["output_path"],
+                end_addr_absolute=config["end_addr_absolute"],
+                use_custom_bound=config["use_custom_bound"],
+                bound_start=config["_raw_bound_start"],
+                bound_end=config["_raw_bound_end"],
+            )
+
+            saved = {k: v for k, v in config.items() if not k.startswith("_raw_")}
+            if isinstance(result, dict) and result.get("total_log_path"):
+                saved["last_output_path"] = result.get("total_log_path")
+                saved["last_output_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                tenet_output = result.get("tenet_combine_path")
+                if tenet_output:
+                    saved["last_tenet_output_path"] = tenet_output
+                    self._set_status(
+                        f"Finished. UC: {result.get('total_log_path')} | Tenet: {tenet_output}"
+                    )
+                else:
+                    self._set_status(f"Finished. Output: {result.get('total_log_path')}")
+            else:
+                self._set_status("Finished")
+            self.plugin.save_cache(saved)
+        except Exception as e:
+            print(f"[-] 运行错误: {e}")
+            import traceback
+            traceback.print_exc()
+            self._set_status(f"运行错误: {e}")
+        finally:
+            self._running = False
+            self._widgets["run_btn"].setEnabled(True)
+            self._stop_log_capture()
+            QtWidgets.QApplication.processEvents()
 
 # ==============================
 # 插件主类
@@ -66,77 +514,34 @@ Auto Range (from IDB): {auto_range_text}
 class UnicornEmulatorPlugin(idaapi.plugin_t):
     """Unicorn ARM64模拟器插件"""
     
-    flags = idaapi.PLUGIN_UNL
-    comment = "ARM64 Unicorn Emulator"
+    flags = idaapi.PLUGIN_KEEP
+    comment = "ARM64 Unicorn Tracer"
     help = "使用Unicorn引擎模拟ARM64代码执行"
-    wanted_name = "Unicorn ARM64 Emulator"
+    wanted_name = "Unicorn ARM64 Tracer"
     wanted_hotkey = "Ctrl-Alt-U"
+
+    def __init__(self):
+        super().__init__()
+        self.form = None
+        self.cache_path = _resolve_cache_path()
 
     def init(self):
         """初始化插件"""
-        print("Unicorn ARM64 Emulator Plugin loaded")
-        print("Use Ctrl-Alt-U to open the emulator")
+        print("Unicorn ARM64 Tracer Plugin loaded")
+        print("Use Ctrl-Alt-U to open the tracer")
+        if QtWidgets is None:
+            print("[-] Qt bindings not found, UI panel cannot be created")
         return idaapi.PLUGIN_OK
 
     def run(self, arg):
         """运行插件"""
         try:
-            auto_base = idaapi.get_imagebase()
-            text_seg = ida_segment.get_segm_by_name(".text")
-            if text_seg:
-                auto_end = text_seg.end_ea
-            else:
-                print("[-] Cannot FOUND .text seg")
+            if QtWidgets is None:
+                print("[-] Qt bindings unavailable")
                 return
-
-            # 创建并显示配置表单
-            form = UnicornEmulatorForm(auto_base, auto_end)
-            form.Compile()
-            
-            ok = form.Execute()
-            if ok == 1:
-                # 获取表单数据
-                end_addr_input = form.end_addr.value
-                so_name = form.so_name.value
-                tpidr_value = form.tpidr_value.value if form.tpidr_value.value != 0 else None
-                flags = form.enable_group.value
-                enable_tenet = bool(flags & 0x1)
-                use_custom_bound = bool(flags & 0x2)
-                end_addr_absolute = bool(flags & 0x4)
-                bound_start = form.bound_start.value
-                bound_end = form.bound_end.value
-                output_path = form.output_path.value
-
-                print(f"[+] 配置参数:")
-                print(f"自动范围: {hex(auto_base)} - {hex(auto_end)}")
-                print(f"结束地址输入: {hex(end_addr_input)} ({'absolute' if end_addr_absolute else 'relative'})")
-                print(f"SO名称: {so_name}")
-                if tpidr_value:
-                    print(f"TPIDR值: {hex(tpidr_value)}")
-                print(f"启用Tenet: {enable_tenet}")
-                if use_custom_bound:
-                    print(f"自定义Bound: {hex(bound_start)} - {hex(bound_end)}")
-                else:
-                    print("自定义Bound: 未启用（使用自动范围）")
-                print(f"输出路径: {output_path}")
-                # 创建模拟器实例并运行
-                if end_addr_input != None:
-                    uni_trace_main(
-                        endaddr_input=end_addr_input,
-                        so_name=so_name,
-                        tpidr_value_input=tpidr_value,
-                        enable_tenet=enable_tenet,
-                        user_path=output_path,
-                        end_addr_absolute=end_addr_absolute,
-                        use_custom_bound=use_custom_bound,
-                        bound_start=bound_start,
-                        bound_end=bound_end,
-                    )
-                else:
-                    print("[+] Wrong Input")
-                
-            form.Free()
-            
+            if self.form is None:
+                self.form = UnicornTracerDialog(self)
+            self.form.ShowPanel()
         except Exception as e:
             print(f"插件运行错误: {e}")
             import traceback
@@ -144,7 +549,32 @@ class UnicornEmulatorPlugin(idaapi.plugin_t):
 
     def term(self):
         """终止插件"""
-        pass
+        if self.form is not None:
+            try:
+                self.form.close()
+            except Exception:
+                pass
+            self.form = None
+
+    def load_cache(self):
+        try:
+            if not os.path.exists(self.cache_path):
+                return {}
+            with open(self.cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+            return {}
+        except Exception as e:
+            print(f"[!] 加载缓存失败: {e}")
+            return {}
+
+    def save_cache(self, data):
+        try:
+            with open(self.cache_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[!] 保存缓存失败: {e}")
 
 # ==============================
 # 插件注册
@@ -285,7 +715,7 @@ class IDAArm64Emulator(Arm64Emulator):
                 self.load_file(os.path.join(load_dumps_path, filename), mem_base, mem_size)
                 self.loaded_files.append(filename)
 
-    def main_trace(self, so_name, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps"):
+    def main_trace(self, end_addr, tenet_log_path=None, user_log_path="./uc.log", load_dumps_path="./dumps"):
         """重写：主要模拟函数，集成IDA错误处理"""
         try:        
             # 初始化日志文件
@@ -302,7 +732,7 @@ class IDAArm64Emulator(Arm64Emulator):
 
                 # 初始化trace日志
                 if self.trace_log:
-                    self.init_trace_log(so_name, load_dumps_path)
+                    self.init_trace_log("", load_dumps_path)
 
                 self.hooks.append(self.mu.hook_add(UC_HOOK_CODE, self.debug_hook_code))
 
@@ -671,7 +1101,6 @@ class IDAArm64Emulator(Arm64Emulator):
 
 def uni_trace_main(
     endaddr_input:int,
-    so_name: str = "",
     tpidr_value_input: int = None,
     enable_tenet=False,
     user_path:str = ".",
@@ -681,11 +1110,19 @@ def uni_trace_main(
     bound_end: int = None,
 ):
     """主函数 - 集成原有脚本的main函数功能"""
-    total_log = open(user_path + f"/uc_combine_{str(int(time.time()))}.log", "w+")
+    total_log_path = os.path.join(user_path, f"uc_combine_{str(int(time.time()))}.log")
+    tenet_combine_path = None
+    tenet_total_log = None
+    if enable_tenet:
+        tenet_combine_path = os.path.join(user_path, f"tenet_combine_{str(int(time.time()))}.log")
+
+    total_log = open(total_log_path, "w+")
+    if tenet_combine_path:
+        tenet_total_log = open(tenet_combine_path, "w+")
 
     dump_round = 0
     while dump_round < ROUND_MAX:
-        print("Emulate ARM64 code")
+        print("Trace ARM64 code")
         emulator = IDAArm64Emulator()
 
         # 创建转储目录
@@ -697,19 +1134,12 @@ def uni_trace_main(
         registers = emulator._collect_register_state()
         
         emulator.BASE = idaapi.get_imagebase()
-
-        text_seg = ida_segment.get_segm_by_name(".text")
-        if text_seg:
-            auto_end = text_seg.end_ea
-            emulator.END = auto_end
-        else:
-            print("[-] Cannot FOUND .text seg")
-            break
-
-        auto_range = (emulator.BASE, auto_end)
+        auto_start, auto_end = _collect_auto_range(verbose=True)
+        emulator.END = auto_end
+        auto_range = (auto_start, auto_end)
         if use_custom_bound:
             if bound_start is None or bound_end is None or bound_start >= bound_end:
-                print("[!] 自定义Bound无效，回退到自动范围")
+                print("[!] 自定义Bound无效，自动使用当前Auto Range")
                 emulator.run_range = auto_range
             else:
                 emulator.run_range = (bound_start, bound_end)
@@ -749,8 +1179,6 @@ def uni_trace_main(
         if bound_end is not None:
             registers["bound_end"] = hex(bound_end)
         registers["enable_tenet"] = bool(enable_tenet)
-        if so_name:
-            registers["so_name"] = so_name
 
         print("[+] DUMPING registers")
         with open(f"{emulator.dump_path}/regs.json", "w+") as f:
@@ -766,7 +1194,7 @@ def uni_trace_main(
 
         # 执行模拟
         while result_code != 114514:
-            result_code = emulator.main_trace(so_name, end_addr, 
+            result_code = emulator.main_trace(end_addr, 
                                         user_log_path=f"{emulator.dump_path}/uc.log", 
                                         tenet_log_path=_tenet_log_path,
                                         load_dumps_path=emulator.dump_path)
@@ -780,6 +1208,12 @@ def uni_trace_main(
         
         with open(f"{emulator.dump_path}/uc.log", "r") as tmp:
             total_log.write(tmp.read())
+
+        if enable_tenet:
+            tenet_round_log_path = f"{emulator.dump_path}/tenet.log"
+            if os.path.exists(tenet_round_log_path):
+                with open(tenet_round_log_path, "r") as tenet_tmp:
+                    tenet_total_log.write(tenet_tmp.read())
 
         # 检查退出条件
         if result_code == 1:
@@ -803,12 +1237,25 @@ def uni_trace_main(
             print("[!] Something Wrong")
         break
     total_log.close()
+    if tenet_total_log:
+        tenet_total_log.close()
+    return {"total_log_path": total_log_path, "tenet_combine_path": tenet_combine_path}
 
 
 if __name__ == "__main__":
     # 创建IDA集成模拟器实例
     
     # 运行模拟
-    uni_trace_main(0x0000, tpidr_value_input=None)
-    
+    # uni_trace_main(0x0000, tpidr_value_input=None)
+    uni_trace_main(
+        endaddr_input=0x0000,
+        tpidr_value_input=None,
+        enable_tenet=False,
+        user_path='.',
+        end_addr_absolute=False,
+        use_custom_bound=False,
+        bound_start=0x0000,
+        bound_end=0x0000,
+    )
+
     # 清理资源
