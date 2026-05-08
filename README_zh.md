@@ -122,6 +122,12 @@ run_all_continuous(
 - 建议运行前关闭无关断点，减少干扰。
 - 中途失败不会破坏旧 dump，已有结果可继续复用。
 
+## 参考
+
+- 看雪文章：https://bbs.kanxue.com/thread-289135.htm
+- Tenet 官方仓库：https://github.com/gaasedelen/tenet
+- Tenet-IDA9.0：https://github.com/jiqiu2022/Tenet-IDA9.0
+
 ## 当前目录结构
 
 ```text

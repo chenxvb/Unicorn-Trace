@@ -124,6 +124,11 @@ See [`example.py`](./example.py) for a hook-based example.
 - Disable unrelated breakpoints when tracing to reduce interference.
 - If a run fails midway, previous dump folders remain usable.
 
+## References
+
+- Tenet (official): https://github.com/gaasedelen/tenet
+- Tenet-IDA9.0: https://github.com/jiqiu2022/Tenet-IDA9.0
+
 ## Repo Layout (Current)
 
 ```text
