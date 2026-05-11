@@ -482,6 +482,12 @@ class UnicornTracerDialog(QtWidgets.QDialog):
             )
 
             saved = {k: v for k, v in config.items() if not k.startswith("_raw_")}
+            # 如果运行中自动获取了tpidr，更新UI和缓存
+            if isinstance(result, dict) and result.get("auto_tpidr") is not None and config["_raw_tpidr_value"] is None:
+                auto_tpidr = result["auto_tpidr"]
+                saved["tpidr_value"] = hex(auto_tpidr)
+                self._widgets["tpidr_value"].setText(hex(auto_tpidr))
+                print(f"[+] TPIDR 已自动填入UI: {hex(auto_tpidr)}")
             if isinstance(result, dict) and result.get("total_log_path"):
                 saved["last_output_path"] = result.get("total_log_path")
                 saved["last_output_time"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -617,7 +623,7 @@ class IDAArm64Emulator(Arm64Emulator):
         """初始化IDA集成模拟器"""
         # 调用父类初始化
         super().__init__(heap_base, heap_size)
-        
+
         # IDA特定的变量
 
         self.mu = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
@@ -626,10 +632,54 @@ class IDAArm64Emulator(Arm64Emulator):
         self.last_regs = None
         self.BASE = 0
         self.run_range = (0, 0)
+        self._tpidr_auto_detected = False
 
     # ==============================
     # 重写父类方法 - 主要模拟
     # ==============================
+
+    def _check_mrs_tpidr(self, address):
+        """检测 mrs Xn, tpidr_el0 指令，通过IDA run_to执行后从目标寄存器读取tpidr值"""
+        if self._tpidr_auto_detected or self.tpidr_value is not None:
+            return
+        code = bytes(self.mu.mem_read(address, 4))
+        # mrs Xn, tpidr_el0: little-endian [0x40|Rn, 0xD0, 0x3B, 0xD5]
+        if code[1] == 0xD0 and code[2] == 0x3B and code[3] == 0xD5 and (code[0] & 0xE0) == 0x40:
+            dest_reg = code[0] & 0x1F
+            print(f"[+] 自动检测到 mrs x{dest_reg}, tpidr_el0 @ 0x{address:x}")
+            try:
+                # run_to mrs指令位置，再步过到 PC+4，让真机执行 mrs
+                ida_dbg.run_to(address)
+                ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
+                ida_dbg.run_to(address + 4)
+                ida_dbg.wait_for_next_event(ida_dbg.WFNE_SUSP, -1)
+                # mrs 执行完毕，目标寄存器已有 tpidr 值
+                tpidr_val = idc.get_reg_value(f"x{dest_reg}")
+                tpidr_val = _normalize_dbg_addr(tpidr_val)
+            except Exception as e:
+                print(f"[!] 通过IDA执行mrs获取tpidr失败: {e}")
+                return
+            self.tpidr_value = tpidr_val
+            self._tpidr_auto_detected = True
+            self.mu.reg_write(UC_ARM64_REG_TPIDR_EL0, tpidr_val)
+            print(f"[+] 从IDA调试器获取 tpidr_el0 = 0x{tpidr_val:x}")
+            regs_path = os.path.join(self.dump_path, "regs.json")
+            if os.path.exists(regs_path):
+                try:
+                    with open(regs_path, "r", encoding="utf-8") as f:
+                        regs = json.load(f)
+                    regs["tpidr"] = hex(tpidr_val)
+                    with open(regs_path, "w", encoding="utf-8") as f:
+                        json.dump(regs, f)
+                    print(f"[+] 已将 tpidr 写入 {regs_path}")
+                except Exception as e:
+                    print(f"[!] 回写 tpidr 到 regs.json 失败: {e}")
+
+    def debug_hook_code(self, uc, address, size, user_data):
+        """重写：增加 mrs tpidr_el0 自动检测"""
+        self._check_mrs_tpidr(address)
+        super().debug_hook_code(uc, address, size, user_data)
+
     def load_memory_mappings(self, load_dumps_path):
         """重写：加载内存映射，集成IDA段信息"""
         mem_list = os.listdir(load_dumps_path)
@@ -1204,8 +1254,13 @@ def uni_trace_main(
             else:
                 break
 
+        # 传播自动检测的tpidr到后续轮次
+        if emulator._tpidr_auto_detected and tpidr_value_input is None:
+            tpidr_value_input = emulator.tpidr_value
+            print(f"[+] 后续轮次将使用自动获取的 tpidr = 0x{tpidr_value_input:x}")
+
         dump_round += 1
-        
+
         with open(f"{emulator.dump_path}/uc.log", "r") as tmp:
             total_log.write(tmp.read())
 
@@ -1239,7 +1294,11 @@ def uni_trace_main(
     total_log.close()
     if tenet_total_log:
         tenet_total_log.close()
-    return {"total_log_path": total_log_path, "tenet_combine_path": tenet_combine_path}
+    return {
+        "total_log_path": total_log_path,
+        "tenet_combine_path": tenet_combine_path,
+        "auto_tpidr": tpidr_value_input,
+    }
 
 
 if __name__ == "__main__":
